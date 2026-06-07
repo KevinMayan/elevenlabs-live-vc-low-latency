@@ -65,9 +65,16 @@ class AudioRecorder:
 
         # Chunked streaming
         self.chunked_mode = settings.chunk_duration > 0
+        self._overlap_seconds = settings.chunk_overlap
+        # Step = how far the window advances each chunk (duration minus overlap)
+        self._chunk_step = (
+            max(settings.chunk_duration - settings.chunk_overlap, 0.001)
+            if self.chunked_mode else settings.chunk_duration
+        )
         self.chunk_queue = queue.Queue()
         self._chunk_counter = 0
-        self._chunk_boundary_pos = 0
+        self._chunk_boundary_pos = 0   # index into audio_data for step boundary
+        self._audio_sample_counts = [] # parallel to audio_data: samples per frame
         self._chunk_producer_thread = None
         self.chunk_stats = ChunkStats()
 
@@ -85,12 +92,7 @@ class AudioRecorder:
         return np.sqrt(np.mean(audio_chunk ** 2))
 
     def chunk_contains_voice(self, chunk_data: list) -> bool:
-        """Return True if the chunk has enough voiced frames to be considered speech.
-
-        Each element of chunk_data is one sounddevice callback buffer.  We compute
-        RMS per buffer and count how many exceed noise_gate_rms, then require at
-        least min_speech_ratio of all frames to be voiced.
-        """
+        """Return True if the chunk has enough voiced frames to be considered speech."""
         if not chunk_data:
             return False
         n_frames = len(chunk_data)
@@ -117,17 +119,20 @@ class AudioRecorder:
                     self.recording_start_time = time.time()
                     self.last_voice_time = time.time()
                     self.audio_data = list(self.pre_buffer)
+                    self._audio_sample_counts = [f.shape[0] for f in self.audio_data]
                     self._chunk_boundary_pos = len(self.audio_data)
                     print(f"\n{colorama.Fore.GREEN}[VAD] Voice detected, recording...{colorama.Style.RESET_ALL}")
             else:
                 if self.is_recording:
                     self.audio_data.append(audio_copy)
+                    self._audio_sample_counts.append(audio_copy.shape[0])
 
                     if rms > self.silence_threshold:
                         self.last_voice_time = time.time()
         else:
             if self.is_recording:
                 self.audio_data.append(audio_copy)
+                self._audio_sample_counts.append(audio_copy.shape[0])
 
     def _vad_monitor(self):
         while not self._stop_vad:
@@ -148,18 +153,17 @@ class AudioRecorder:
                 break
 
     def _chunk_producer(self):
-        chunk_duration = self.settings.chunk_duration
+        chunk_step = self._chunk_step
 
         while not self._stop_vad:
-            # Wait until actually recording (relevant for VAD mode where stream starts
-            # before voice is detected)
+            # Wait until actually recording (relevant for VAD mode)
             if not self.is_recording:
                 time.sleep(0.05)
                 continue
 
             recording_start = self.recording_start_time
             elapsed = time.time() - recording_start
-            next_boundary = ((elapsed // chunk_duration) + 1) * chunk_duration
+            next_boundary = ((elapsed // chunk_step) + 1) * chunk_step
             sleep_for = next_boundary - elapsed
 
             time.sleep(max(0.01, sleep_for))
@@ -174,22 +178,50 @@ class AudioRecorder:
         if current_pos <= self._chunk_boundary_pos:
             return
 
-        chunk_data = list(self.audio_data[self._chunk_boundary_pos:current_pos])
-        self._chunk_boundary_pos = current_pos
+        # Build overlap window: walk back from step boundary to collect overlap_seconds
+        overlap_samples_needed = int(self._overlap_seconds * self.settings.sample_rate)
+        samples_collected = 0
+        overlap_start = self._chunk_boundary_pos
+        while overlap_start > 0 and samples_collected < overlap_samples_needed:
+            overlap_start -= 1
+            samples_collected += self._audio_sample_counts[overlap_start]
+
+        old_boundary = self._chunk_boundary_pos
+        chunk_data = list(self.audio_data[overlap_start:current_pos])
+        overlap_frame_count = old_boundary - overlap_start  # frames at start that are overlap
+
         self._chunk_counter += 1
         chunk_num = self._chunk_counter
         capture_ts = time.time()
 
+        # Compute window timing for log
+        chunk_total_samples = sum(f.shape[0] for f in chunk_data)
+        chunk_duration_s = chunk_total_samples / self.settings.sample_rate
+        window_end_s = capture_ts - self.recording_start_time
+        window_start_s = window_end_s - chunk_duration_s
+        actual_overlap_s = samples_collected / self.settings.sample_rate
+
+        # Advance step boundary
+        self._chunk_boundary_pos = current_pos
+
+        # Trim audio_data front — keep only the overlap window for the next chunk
+        if overlap_start > 0:
+            del self.audio_data[:overlap_start]
+            del self._audio_sample_counts[:overlap_start]
+            self._chunk_boundary_pos -= overlap_start
+
         if self.chunk_contains_voice(chunk_data):
-            self.chunk_queue.put((chunk_num, chunk_data, capture_ts))
+            self.chunk_queue.put((chunk_num, chunk_data, capture_ts, overlap_frame_count))
             self.chunk_stats.record_queued()
             print(
-                f"{colorama.Fore.CYAN}[Chunk #{chunk_num}] queued "
-                f"({len(chunk_data)} frames, speech detected){colorama.Style.RESET_ALL}"
+                f"{colorama.Fore.CYAN}"
+                f"[Chunk #{chunk_num}] queued ({len(chunk_data)} frames, speech detected)\n"
+                f"  Duration: {chunk_duration_s:.1f}s | Overlap: {actual_overlap_s:.1f}s | "
+                f"Window: {window_start_s:.1f}s → {window_end_s:.1f}s"
+                f"{colorama.Style.RESET_ALL}"
             )
         else:
             self.chunk_stats.record_dropped()
-            # Determine drop reason for the log message
             if not chunk_data:
                 reason = "empty"
             else:
@@ -217,6 +249,7 @@ class AudioRecorder:
         if not self.is_recording:
             self.is_recording = True
             self.audio_data = []
+            self._audio_sample_counts = []
             self.recording_start_time = time.time()
             self.last_voice_time = time.time()
             self._stop_vad = False
@@ -256,6 +289,7 @@ class AudioRecorder:
     def start_continuous(self):
         if self.vad_enabled:
             self.audio_data = []
+            self._audio_sample_counts = []
             self.pre_buffer.clear()
             self.voice_detected = False
             self.is_recording = False

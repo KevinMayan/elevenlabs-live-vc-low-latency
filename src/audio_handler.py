@@ -40,12 +40,22 @@ class AudioHandler:
             target=self._upload_worker, daemon=True, name="upload-worker"
         )
         self._upload_worker_thread.start()
-        print(f"{colorama.Fore.GREEN}[Upload] Worker started (chunked mode){colorama.Style.RESET_ALL}")
+
+        chunk_duration = self.recorder.settings.chunk_duration
+        chunk_overlap = self.recorder.settings.chunk_overlap
+        chunk_step = self.recorder._chunk_step
+        print(
+            f"{colorama.Fore.GREEN}[Upload] Worker started (chunked mode)\n"
+            f"  Chunk Duration: {chunk_duration:.1f}s\n"
+            f"  Chunk Overlap:  {chunk_overlap:.1f}s\n"
+            f"  Effective Step: {chunk_step:.1f}s"
+            f"{colorama.Style.RESET_ALL}"
+        )
 
     def _upload_worker(self):
         while self._upload_worker_running:
             try:
-                chunk_num, chunk_data, capture_ts = self.recorder.chunk_queue.get(timeout=0.5)
+                chunk_num, chunk_data, capture_ts, overlap_frame_count = self.recorder.chunk_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
 
@@ -68,6 +78,7 @@ class AudioHandler:
                 chunk_num=chunk_num,
                 capture_ts=capture_ts,
                 upload_start=upload_start,
+                overlap_frame_count=overlap_frame_count,
             )
 
     def stop_upload_worker(self):

@@ -119,6 +119,7 @@ class ElevenLabsClient:
         chunk_num: int | None = None,
         capture_ts: float | None = None,
         upload_start: float | None = None,
+        overlap_frame_count: int = 0,
     ):
         label = f"[Chunk #{chunk_num}]" if chunk_num is not None else "[Audio]"
         request_start = time.time()

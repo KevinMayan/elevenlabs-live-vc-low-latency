@@ -4,7 +4,8 @@
 > The original project records a full utterance before uploading. This fork adds a
 > **chunked streaming mode** that continuously sends audio to ElevenLabs while you are
 > still speaking, cutting perceived latency from ~30 s down to ~7 s for typical speech.
-> All original modes are preserved and work unchanged.
+> Chunks overlap so the STS model always has context from the previous window, reducing
+> clipped words at boundaries. All original modes are preserved and work unchanged.
 
 [![build](https://github.com/cavoq/elevenlabs-live-vc/actions/workflows/build.yml/badge.svg)](https://github.com/cavoq/elevenlabs-live-vc/actions/workflows/build.yml)
 
@@ -27,6 +28,7 @@ Original author: https://github.com/cavoq
 | | Original | This fork |
 |---|---|---|
 | Upload trigger | Recording stops | Every N seconds while speaking |
+| Chunk boundaries | N/A | Overlapping sliding window — no clipped words |
 | Playback stream | Created/destroyed per request | Persistent — no gaps between chunks |
 | Perceived latency | utterance length + ~2.8 s | ~2.8 s after first chunk (typically < 7 s) |
 | `optimize_streaming_latency` | Not exposed | Configurable via env var |
@@ -37,7 +39,7 @@ Original author: https://github.com/cavoq
 
 ```
 Mic → [AudioRecorder]
-         │  every CHUNK_DURATION_SECONDS seconds
+         │  every CHUNK_DURATION_SECONDS - CHUNK_OVERLAP_SECONDS
          ▼
       chunk_queue  ←─────────────────────────────────────┐
          │                                               │
@@ -54,6 +56,19 @@ Mic → [AudioRecorder]
 The microphone never stops. Each chunk is uploaded as soon as it is cut, so ElevenLabs
 starts processing chunk 1 while chunk 2 is still being recorded.
 
+With `CHUNK_DURATION_SECONDS=4` and `CHUNK_OVERLAP_SECONDS=1` the sliding window looks
+like this (step = 3 s):
+
+```
+Chunk 1:  0s ──────────── 4s
+Chunk 2:       3s ──────────── 7s
+Chunk 3:            6s ──────────── 10s
+              ↑ 1s overlap gives STS model context from previous chunk
+```
+
+Without overlap every chunk boundary is a hard cut and the model has no prior context,
+causing missing syllables and unnatural starts/ends.
+
 ---
 
 ## Features
@@ -64,6 +79,7 @@ starts processing chunk 1 while chunk 2 is still being recorded.
   - **Manual (MODE=0)** - Press SPACE to start/stop recording
   - **Automatic (MODE=1)** - Voice Activity Detection auto-detects speech
   - **Chunked streaming** - Overlay on MODE=0 or MODE=1 via `CHUNK_DURATION_SECONDS`
+- **Overlapping sliding window** - Configurable overlap between chunks so the STS model always has prior-speech context, reducing clipped words at boundaries
 - **Chunk filtering** - Silent and noisy chunks are dropped before upload, saving API credits and reducing clutter
 - **Per-chunk latency dashboard** - Console output with rolling averages and drop-rate stats
 - **Configurable Audio Settings** - Sample rate, channels, silence threshold, noise reduction
@@ -141,7 +157,7 @@ MODE=0
 
 # Optional - Chunked low-latency streaming (this fork)
 # CHUNK_DURATION_SECONDS=4      # seconds per chunk; 0 = disabled (original behavior)
-# CHUNK_OVERLAP_SECONDS=0       # overlap between chunks (future use)
+# CHUNK_OVERLAP_SECONDS=1       # overlap between chunks (must be < CHUNK_DURATION_SECONDS)
 # OPTIMIZE_STREAMING_LATENCY=4  # ElevenLabs latency hint 0-4 (4 = most aggressive)
 
 # Optional - Chunk filtering (VAD gate before upload)
@@ -180,26 +196,44 @@ Add to `.env`:
 
 ```env
 CHUNK_DURATION_SECONDS=4
+CHUNK_OVERLAP_SECONDS=1
 OPTIMIZE_STREAMING_LATENCY=4
 ```
 
-Works alongside `MODE=0` or `MODE=1`. While you speak, audio is split every 4 seconds
-and sent to ElevenLabs immediately. You will hear the first converted output in ~7 s
-while the rest of your speech continues to be processed in the background.
+Works alongside `MODE=0` or `MODE=1`. While you speak, audio is cut every
+`CHUNK_DURATION_SECONDS - CHUNK_OVERLAP_SECONDS` seconds (the *effective step*) and
+sent to ElevenLabs immediately. Each chunk includes the preceding `CHUNK_OVERLAP_SECONDS`
+of audio so the model has context from the previous window.
+
+Startup summary printed on launch:
+
+```
+[Upload] Worker started (chunked mode)
+  Chunk Duration: 4.0s
+  Chunk Overlap:  1.0s
+  Effective Step: 3.0s
+```
 
 Console output per chunk:
 
 ```
 [Chunk #1] queued (187 frames, speech detected)
+  Duration: 3.0s | Overlap: 0.0s | Window: 0.0s → 3.0s
 [Chunk #1] uploading...
 [Chunk #1] Capture→First-audio: 6821ms | Upload delay: 42ms | EL latency: 2784ms
   Rolling avg (n=1) | First-chunk: 2784ms | Queue delay: 42ms
 
-[Chunk #2] dropped (silence)
-[Chunk #3] dropped (noise (ratio=0.12))
+[Chunk #2] queued (234 frames, speech detected)
+  Duration: 4.0s | Overlap: 1.0s | Window: 3.0s → 7.0s
+
+[Chunk #3] dropped (silence)
+[Chunk #4] dropped (noise (ratio=0.12))
 ...
 [Stats] Chunks queued: 8 | Chunks dropped: 2 | Drop rate: 20%   ← every 10 chunks
 ```
+
+The first chunk has no overlap (there is no prior audio to look back to). From chunk 2
+onward each chunk includes the last `CHUNK_OVERLAP_SECONDS` of the previous chunk.
 
 ### Commands
 
@@ -270,6 +304,11 @@ docker run --env-file .env -it --privileged -v /dev/input:/dev/input el-live-vc
 - Lower `NOISE_GATE_RMS` (e.g. `0.005`) if your microphone is quiet
 - Raise `NOISE_GATE_RMS` (e.g. `0.02`) to be more aggressive about dropping background noise
 
+### Chunked mode: clipped words or unnatural transitions
+
+- Enable overlap: set `CHUNK_OVERLAP_SECONDS=1` (or higher) to give the model prior context
+- Keep `CHUNK_OVERLAP_SECONDS` well below `CHUNK_DURATION_SECONDS`; values ≥ duration are automatically clamped to 50% of duration
+
 ### Chunked mode: gaps or overlap in playback
 
 - Reduce `CHUNK_DURATION_SECONDS` (e.g. `3`) if queue backlog builds
@@ -298,7 +337,7 @@ docker run --env-file .env -it --privileged -v /dev/input:/dev/input el-live-vc
 | `VAD_PRE_BUFFER_DURATION` | 0.5 | Pre-buffer duration (s) |
 | `MODE` | 0 | 0=Manual, 1=VAD |
 | `CHUNK_DURATION_SECONDS` | 0 | Chunk size in seconds; 0 = disabled |
-| `CHUNK_OVERLAP_SECONDS` | 0 | Chunk overlap (future use) |
+| `CHUNK_OVERLAP_SECONDS` | 0 | Overlap between chunks in seconds (must be < `CHUNK_DURATION_SECONDS`); effective step = duration − overlap |
 | `OPTIMIZE_STREAMING_LATENCY` | 4 | ElevenLabs latency hint (0–4) |
 | `MIN_SPEECH_RATIO` | 0.25 | Fraction of frames above `NOISE_GATE_RMS` required to keep a chunk |
 | `NOISE_GATE_RMS` | 0.01 | Per-frame RMS threshold for the speech ratio filter |
@@ -312,6 +351,6 @@ GNU General Public License v3.0 - See [LICENSE](LICENSE) for details.
 
 - **Original author**: [cavoq](https://github.com/cavoq)
 - **Additional contributors**: [ayeantics](https://github.com/ayeantics)
-- **Fork modifications**: chunked streaming pipeline, persistent playback stream, VAD-based chunk filtering, latency metrics
+- **Fork modifications**: chunked streaming pipeline, overlapping sliding-window chunks, persistent playback stream, VAD-based chunk filtering, latency metrics
 - **ElevenLabs**: [https://elevenlabs.io](https://elevenlabs.io)
 - **VB-Audio**: [https://vb-audio.com](https://vb-audio.com)

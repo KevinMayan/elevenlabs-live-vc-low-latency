@@ -31,6 +31,13 @@ class AudioSettings:
         self.vad_pre_buffer_duration = vad_pre_buffer_duration
         self.input_device = input_device
         self.chunk_duration = chunk_duration
+        if chunk_duration > 0 and chunk_overlap >= chunk_duration:
+            clamped = chunk_duration * 0.5
+            print(
+                f"[Config] CHUNK_OVERLAP_SECONDS ({chunk_overlap:.2f}s) must be < "
+                f"CHUNK_DURATION_SECONDS ({chunk_duration:.2f}s). Clamping to {clamped:.2f}s."
+            )
+            chunk_overlap = clamped
         self.chunk_overlap = chunk_overlap
         self.optimize_streaming_latency = optimize_streaming_latency
         self.min_speech_ratio = min_speech_ratio
