@@ -9,6 +9,35 @@ from collections import deque
 from src.settings.audio import AudioSettings
 
 
+class ChunkStats:
+    """Thread-safe counters for chunk filtering metrics."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.queued = 0
+        self.dropped = 0
+
+    def record_queued(self):
+        with self._lock:
+            self.queued += 1
+
+    def record_dropped(self):
+        with self._lock:
+            self.dropped += 1
+
+    def summary(self) -> str:
+        with self._lock:
+            total = self.queued + self.dropped
+            if total == 0:
+                return ""
+            drop_rate = (self.dropped / total) * 100
+            return (
+                f"Chunks queued: {self.queued} | "
+                f"Chunks dropped: {self.dropped} | "
+                f"Drop rate: {drop_rate:.0f}%"
+            )
+
+
 class AudioRecorder:
     def __init__(self, settings: AudioSettings):
         self.settings = settings
@@ -40,6 +69,7 @@ class AudioRecorder:
         self._chunk_counter = 0
         self._chunk_boundary_pos = 0
         self._chunk_producer_thread = None
+        self.chunk_stats = ChunkStats()
 
     @classmethod
     def from_env(cls):
@@ -53,6 +83,22 @@ class AudioRecorder:
 
     def _calculate_rms(self, audio_chunk):
         return np.sqrt(np.mean(audio_chunk ** 2))
+
+    def chunk_contains_voice(self, chunk_data: list) -> bool:
+        """Return True if the chunk has enough voiced frames to be considered speech.
+
+        Each element of chunk_data is one sounddevice callback buffer.  We compute
+        RMS per buffer and count how many exceed noise_gate_rms, then require at
+        least min_speech_ratio of all frames to be voiced.
+        """
+        if not chunk_data:
+            return False
+        n_frames = len(chunk_data)
+        voiced = sum(
+            1 for frame in chunk_data
+            if self._calculate_rms(frame) >= self.settings.noise_gate_rms
+        )
+        return (voiced / n_frames) >= self.settings.min_speech_ratio
 
     def callback(self, indata, frames, time_info, status):
         if status:
@@ -134,11 +180,35 @@ class AudioRecorder:
         chunk_num = self._chunk_counter
         capture_ts = time.time()
 
-        self.chunk_queue.put((chunk_num, chunk_data, capture_ts))
-        print(
-            f"{colorama.Fore.CYAN}[Chunk #{chunk_num}] queued "
-            f"({len(chunk_data)} frames){colorama.Style.RESET_ALL}"
-        )
+        if self.chunk_contains_voice(chunk_data):
+            self.chunk_queue.put((chunk_num, chunk_data, capture_ts))
+            self.chunk_stats.record_queued()
+            print(
+                f"{colorama.Fore.CYAN}[Chunk #{chunk_num}] queued "
+                f"({len(chunk_data)} frames, speech detected){colorama.Style.RESET_ALL}"
+            )
+        else:
+            self.chunk_stats.record_dropped()
+            # Determine drop reason for the log message
+            if not chunk_data:
+                reason = "empty"
+            else:
+                n = len(chunk_data)
+                voiced = sum(
+                    1 for f in chunk_data
+                    if self._calculate_rms(f) >= self.settings.noise_gate_rms
+                )
+                reason = "silence" if voiced == 0 else f"noise (ratio={voiced/n:.2f})"
+            print(
+                f"{colorama.Fore.YELLOW}[Chunk #{chunk_num}] dropped "
+                f"({reason}){colorama.Style.RESET_ALL}"
+            )
+
+        # Print cumulative stats every 10 chunks
+        if self._chunk_counter % 10 == 0:
+            summary = self.chunk_stats.summary()
+            if summary:
+                print(f"{colorama.Fore.MAGENTA}[Stats] {summary}{colorama.Style.RESET_ALL}")
 
     def _flush_final_chunk(self):
         self._extract_chunk()

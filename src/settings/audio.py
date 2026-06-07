@@ -16,6 +16,8 @@ class AudioSettings:
         chunk_duration=0.0,
         chunk_overlap=0.0,
         optimize_streaming_latency=4,
+        min_speech_ratio=0.25,
+        noise_gate_rms=0.01,
     ):
         self.mode = mode
         self.sample_rate = sample_rate
@@ -31,6 +33,8 @@ class AudioSettings:
         self.chunk_duration = chunk_duration
         self.chunk_overlap = chunk_overlap
         self.optimize_streaming_latency = optimize_streaming_latency
+        self.min_speech_ratio = min_speech_ratio
+        self.noise_gate_rms = noise_gate_rms
 
     def valid_modes(self):
         return [0, 1]
@@ -62,4 +66,6 @@ class AudioSettings:
             chunk_duration=float(os.getenv("CHUNK_DURATION_SECONDS", 0)),
             chunk_overlap=float(os.getenv("CHUNK_OVERLAP_SECONDS", 0)),
             optimize_streaming_latency=int(os.getenv("OPTIMIZE_STREAMING_LATENCY", 4)),
+            min_speech_ratio=float(os.getenv("MIN_SPEECH_RATIO", 0.25)),
+            noise_gate_rms=float(os.getenv("NOISE_GATE_RMS", 0.01)),
         )
