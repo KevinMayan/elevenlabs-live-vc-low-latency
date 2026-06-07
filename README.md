@@ -31,6 +31,7 @@ Original author: https://github.com/cavoq
 | Perceived latency | utterance length + ~2.8 s | ~2.8 s after first chunk (typically < 7 s) |
 | `optimize_streaming_latency` | Not exposed | Configurable via env var |
 | Latency metrics | First-chunk time only | Per-chunk breakdown + rolling averages |
+| Silence/noise chunks | Always uploaded | Filtered out before upload (VAD gate) |
 
 ### How chunked mode works
 
@@ -63,7 +64,8 @@ starts processing chunk 1 while chunk 2 is still being recorded.
   - **Manual (MODE=0)** - Press SPACE to start/stop recording
   - **Automatic (MODE=1)** - Voice Activity Detection auto-detects speech
   - **Chunked streaming** - Overlay on MODE=0 or MODE=1 via `CHUNK_DURATION_SECONDS`
-- **Per-chunk latency dashboard** - Console output with rolling averages
+- **Chunk filtering** - Silent and noisy chunks are dropped before upload, saving API credits and reducing clutter
+- **Per-chunk latency dashboard** - Console output with rolling averages and drop-rate stats
 - **Configurable Audio Settings** - Sample rate, channels, silence threshold, noise reduction
 
 ## Use Cases
@@ -141,6 +143,11 @@ MODE=0
 # CHUNK_DURATION_SECONDS=4      # seconds per chunk; 0 = disabled (original behavior)
 # CHUNK_OVERLAP_SECONDS=0       # overlap between chunks (future use)
 # OPTIMIZE_STREAMING_LATENCY=4  # ElevenLabs latency hint 0-4 (4 = most aggressive)
+
+# Optional - Chunk filtering (VAD gate before upload)
+# MIN_SPEECH_RATIO=0.25         # fraction of frames that must exceed noise gate to keep a chunk
+# NOISE_GATE_RMS=0.01           # per-frame RMS threshold used by the speech ratio filter
+# MIN_AUDIO_DURATION=0.1        # minimum audio duration in seconds before processing
 ```
 
 ## Usage
@@ -183,10 +190,15 @@ while the rest of your speech continues to be processed in the background.
 Console output per chunk:
 
 ```
-[Chunk #1] queued (187 frames)
+[Chunk #1] queued (187 frames, speech detected)
 [Chunk #1] uploading...
 [Chunk #1] Capture→First-audio: 6821ms | Upload delay: 42ms | EL latency: 2784ms
   Rolling avg (n=1) | First-chunk: 2784ms | Queue delay: 42ms
+
+[Chunk #2] dropped (silence)
+[Chunk #3] dropped (noise (ratio=0.12))
+...
+[Stats] Chunks queued: 8 | Chunks dropped: 2 | Drop rate: 20%   ← every 10 chunks
 ```
 
 ### Commands
@@ -252,6 +264,12 @@ docker run --env-file .env -it --privileged -v /dev/input:/dev/input el-live-vc
 - Check your ElevenLabs account has credits
 - Ensure the Voice ID exists and you have access to it
 
+### Too many chunks dropped
+
+- Lower `MIN_SPEECH_RATIO` (e.g. `0.10`) if legitimate speech is being filtered out
+- Lower `NOISE_GATE_RMS` (e.g. `0.005`) if your microphone is quiet
+- Raise `NOISE_GATE_RMS` (e.g. `0.02`) to be more aggressive about dropping background noise
+
 ### Chunked mode: gaps or overlap in playback
 
 - Reduce `CHUNK_DURATION_SECONDS` (e.g. `3`) if queue backlog builds
@@ -282,6 +300,9 @@ docker run --env-file .env -it --privileged -v /dev/input:/dev/input el-live-vc
 | `CHUNK_DURATION_SECONDS` | 0 | Chunk size in seconds; 0 = disabled |
 | `CHUNK_OVERLAP_SECONDS` | 0 | Chunk overlap (future use) |
 | `OPTIMIZE_STREAMING_LATENCY` | 4 | ElevenLabs latency hint (0–4) |
+| `MIN_SPEECH_RATIO` | 0.25 | Fraction of frames above `NOISE_GATE_RMS` required to keep a chunk |
+| `NOISE_GATE_RMS` | 0.01 | Per-frame RMS threshold for the speech ratio filter |
+| `MIN_AUDIO_DURATION` | 0.1 | Minimum audio duration (s) before a recording is processed |
 
 ## License
 
@@ -291,6 +312,6 @@ GNU General Public License v3.0 - See [LICENSE](LICENSE) for details.
 
 - **Original author**: [cavoq](https://github.com/cavoq)
 - **Additional contributors**: [ayeantics](https://github.com/ayeantics)
-- **Fork modifications**: chunked streaming pipeline, persistent playback stream, latency metrics
+- **Fork modifications**: chunked streaming pipeline, persistent playback stream, VAD-based chunk filtering, latency metrics
 - **ElevenLabs**: [https://elevenlabs.io](https://elevenlabs.io)
 - **VB-Audio**: [https://vb-audio.com](https://vb-audio.com)
