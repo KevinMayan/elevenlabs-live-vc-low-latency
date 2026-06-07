@@ -2,6 +2,7 @@ import numpy as np
 import sounddevice as sd
 import threading
 import time
+import queue
 import colorama
 from collections import deque
 
@@ -33,6 +34,13 @@ class AudioRecorder:
         self.pre_buffer_chunks = int(self.pre_buffer_duration * settings.sample_rate / 1024) + 5
         self.pre_buffer = deque(maxlen=self.pre_buffer_chunks)
 
+        # Chunked streaming
+        self.chunked_mode = settings.chunk_duration > 0
+        self.chunk_queue = queue.Queue()
+        self._chunk_counter = 0
+        self._chunk_boundary_pos = 0
+        self._chunk_producer_thread = None
+
     @classmethod
     def from_env(cls):
         return cls(AudioSettings.from_env())
@@ -63,6 +71,7 @@ class AudioRecorder:
                     self.recording_start_time = time.time()
                     self.last_voice_time = time.time()
                     self.audio_data = list(self.pre_buffer)
+                    self._chunk_boundary_pos = len(self.audio_data)
                     print(f"\n{colorama.Fore.GREEN}[VAD] Voice detected, recording...{colorama.Style.RESET_ALL}")
             else:
                 if self.is_recording:
@@ -92,6 +101,48 @@ class AudioRecorder:
                     self.vad_callback()
                 break
 
+    def _chunk_producer(self):
+        chunk_duration = self.settings.chunk_duration
+
+        while not self._stop_vad:
+            # Wait until actually recording (relevant for VAD mode where stream starts
+            # before voice is detected)
+            if not self.is_recording:
+                time.sleep(0.05)
+                continue
+
+            recording_start = self.recording_start_time
+            elapsed = time.time() - recording_start
+            next_boundary = ((elapsed // chunk_duration) + 1) * chunk_duration
+            sleep_for = next_boundary - elapsed
+
+            time.sleep(max(0.01, sleep_for))
+
+            if self._stop_vad or not self.is_recording:
+                break
+
+            self._extract_chunk()
+
+    def _extract_chunk(self):
+        current_pos = len(self.audio_data)
+        if current_pos <= self._chunk_boundary_pos:
+            return
+
+        chunk_data = list(self.audio_data[self._chunk_boundary_pos:current_pos])
+        self._chunk_boundary_pos = current_pos
+        self._chunk_counter += 1
+        chunk_num = self._chunk_counter
+        capture_ts = time.time()
+
+        self.chunk_queue.put((chunk_num, chunk_data, capture_ts))
+        print(
+            f"{colorama.Fore.CYAN}[Chunk #{chunk_num}] queued "
+            f"({len(chunk_data)} frames){colorama.Style.RESET_ALL}"
+        )
+
+    def _flush_final_chunk(self):
+        self._extract_chunk()
+
     def start(self):
         if not self.is_recording:
             self.is_recording = True
@@ -100,6 +151,7 @@ class AudioRecorder:
             self.last_voice_time = time.time()
             self._stop_vad = False
             self.voice_detected = True
+            self._chunk_boundary_pos = 0
 
             self.stream = sd.InputStream(
                 callback=self.callback,
@@ -114,6 +166,12 @@ class AudioRecorder:
                 self._vad_thread = threading.Thread(target=self._vad_monitor, daemon=True)
                 self._vad_thread.start()
 
+            if self.chunked_mode:
+                self._chunk_producer_thread = threading.Thread(
+                    target=self._chunk_producer, daemon=True
+                )
+                self._chunk_producer_thread.start()
+
     def stop(self):
         if self.is_recording and self.stream is not None:
             self._stop_vad = True
@@ -122,6 +180,9 @@ class AudioRecorder:
             self.is_recording = False
             self.voice_detected = False
 
+            if self.chunked_mode:
+                self._flush_final_chunk()
+
     def start_continuous(self):
         if self.vad_enabled:
             self.audio_data = []
@@ -129,6 +190,7 @@ class AudioRecorder:
             self.voice_detected = False
             self.is_recording = False
             self._stop_vad = False
+            self._chunk_boundary_pos = 0
 
             print(f"{colorama.Fore.GREEN}[VAD] Listening for voice...{colorama.Style.RESET_ALL}")
 
@@ -143,3 +205,9 @@ class AudioRecorder:
 
             self._vad_thread = threading.Thread(target=self._vad_monitor, daemon=True)
             self._vad_thread.start()
+
+            if self.chunked_mode:
+                self._chunk_producer_thread = threading.Thread(
+                    target=self._chunk_producer, daemon=True
+                )
+                self._chunk_producer_thread.start()

@@ -1,3 +1,6 @@
+import queue
+import threading
+import time
 import colorama
 import keyboard
 from src.audio_processor import AudioProcessor
@@ -10,10 +13,18 @@ class AudioHandler:
         self.recorder = recorder
         self.processor = processor
         self.el_client = el_client
+        self.chunked_mode = recorder.chunked_mode
+
         keyboard.on_press_key("space", self.handle_recording)
 
         if self.recorder.vad_enabled:
             self.recorder.set_vad_callback(self.process_vad_recording)
+
+        self._upload_worker_thread: threading.Thread | None = None
+        self._upload_worker_running = False
+
+        if self.chunked_mode:
+            self._start_upload_worker()
 
     @classmethod
     def from_env(cls):
@@ -23,6 +34,45 @@ class AudioHandler:
             ElevenLabsClient.from_env()
         )
 
+    def _start_upload_worker(self):
+        self._upload_worker_running = True
+        self._upload_worker_thread = threading.Thread(
+            target=self._upload_worker, daemon=True, name="upload-worker"
+        )
+        self._upload_worker_thread.start()
+        print(f"{colorama.Fore.GREEN}[Upload] Worker started (chunked mode){colorama.Style.RESET_ALL}")
+
+    def _upload_worker(self):
+        while self._upload_worker_running:
+            try:
+                chunk_num, chunk_data, capture_ts = self.recorder.chunk_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+
+            upload_start = time.time()
+            print(
+                f"{colorama.Fore.CYAN}[Chunk #{chunk_num}] uploading...{colorama.Style.RESET_ALL}"
+            )
+
+            audio_stream = self.processor.get_audio_stream(chunk_data)
+            if audio_stream is None:
+                print(
+                    f"{colorama.Fore.YELLOW}[Chunk #{chunk_num}] skipped "
+                    f"(no usable audio){colorama.Style.RESET_ALL}"
+                )
+                continue
+
+            self.el_client.convert_audio(
+                audio_stream,
+                remove_background_noise=self.recorder.settings.remove_background_noise,
+                chunk_num=chunk_num,
+                capture_ts=capture_ts,
+                upload_start=upload_start,
+            )
+
+    def stop_upload_worker(self):
+        self._upload_worker_running = False
+
     def handle_recording(self, event):
         if self.recorder.is_recording:
             print(
@@ -30,11 +80,14 @@ class AudioHandler:
                     colorama.Style.RESET_ALL}"
             )
             self.recorder.stop()
-            audio = self.recorder.get_audio_data()
-            self.el_client.convert_audio(
-                self.processor.get_audio_stream(audio),
-                remove_background_noise=self.recorder.settings.remove_background_noise
-            )
+
+            if not self.chunked_mode:
+                audio = self.recorder.get_audio_data()
+                self.el_client.convert_audio(
+                    self.processor.get_audio_stream(audio),
+                    remove_background_noise=self.recorder.settings.remove_background_noise,
+                )
+
             if self.recorder.vad_enabled:
                 self.recorder.start_continuous()
         else:
@@ -45,16 +98,21 @@ class AudioHandler:
             self.recorder.start()
 
     def process_vad_recording(self):
-        audio = self.recorder.get_audio_data()
-        audio_stream = self.processor.get_audio_stream(audio)
-        if audio_stream is None:
-            print(f"{colorama.Fore.YELLOW}No usable audio recorded. Try speaking longer.{colorama.Style.RESET_ALL}")
-            self.recorder.start_continuous()
-            return
-        self.el_client.convert_audio(
-            audio_stream,
-            remove_background_noise=self.recorder.settings.remove_background_noise
-        )
+        if not self.chunked_mode:
+            audio = self.recorder.get_audio_data()
+            audio_stream = self.processor.get_audio_stream(audio)
+            if audio_stream is None:
+                print(
+                    f"{colorama.Fore.YELLOW}No usable audio recorded. "
+                    f"Try speaking longer.{colorama.Style.RESET_ALL}"
+                )
+                self.recorder.start_continuous()
+                return
+            self.el_client.convert_audio(
+                audio_stream,
+                remove_background_noise=self.recorder.settings.remove_background_noise,
+            )
+
         self.recorder.start_continuous()
 
     def start_vad_mode(self):

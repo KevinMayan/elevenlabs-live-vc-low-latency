@@ -12,7 +12,10 @@ class AudioSettings:
         vad_silence_duration=0.8,
         vad_min_recording_duration=0.3,
         vad_pre_buffer_duration=0.5,
-        input_device=None
+        input_device=None,
+        chunk_duration=0.0,
+        chunk_overlap=0.0,
+        optimize_streaming_latency=4,
     ):
         self.mode = mode
         self.sample_rate = sample_rate
@@ -25,6 +28,9 @@ class AudioSettings:
         self.vad_min_recording_duration = vad_min_recording_duration
         self.vad_pre_buffer_duration = vad_pre_buffer_duration
         self.input_device = input_device
+        self.chunk_duration = chunk_duration
+        self.chunk_overlap = chunk_overlap
+        self.optimize_streaming_latency = optimize_streaming_latency
 
     def valid_modes(self):
         return [0, 1]
@@ -52,5 +58,8 @@ class AudioSettings:
             vad_silence_duration=float(os.getenv("VAD_SILENCE_DURATION", 0.8)),
             vad_min_recording_duration=float(os.getenv("VAD_MIN_RECORDING_DURATION", 0.3)),
             vad_pre_buffer_duration=float(os.getenv("VAD_PRE_BUFFER_DURATION", 0.5)),
-            input_device=input_device
+            input_device=input_device,
+            chunk_duration=float(os.getenv("CHUNK_DURATION_SECONDS", 0)),
+            chunk_overlap=float(os.getenv("CHUNK_OVERLAP_SECONDS", 0)),
+            optimize_streaming_latency=int(os.getenv("OPTIMIZE_STREAMING_LATENCY", 4)),
         )
