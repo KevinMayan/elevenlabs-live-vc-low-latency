@@ -10,20 +10,29 @@ from src.settings.audio import AudioSettings
 
 
 class ChunkStats:
-    """Thread-safe counters for chunk filtering metrics."""
+    """Thread-safe counters and accumulators for chunk filtering metrics."""
 
     def __init__(self):
         self._lock = threading.Lock()
         self.queued = 0
         self.dropped = 0
+        self._total_speech_ratio = 0.0
+        self._total_avg_prob = 0.0
+        self._analyzed = 0
 
-    def record_queued(self):
+    def record_queued(self, speech_ratio: float = 0.0, avg_prob: float = 0.0):
         with self._lock:
             self.queued += 1
+            self._total_speech_ratio += speech_ratio
+            self._total_avg_prob += avg_prob
+            self._analyzed += 1
 
-    def record_dropped(self):
+    def record_dropped(self, speech_ratio: float = 0.0, avg_prob: float = 0.0):
         with self._lock:
             self.dropped += 1
+            self._total_speech_ratio += speech_ratio
+            self._total_avg_prob += avg_prob
+            self._analyzed += 1
 
     def summary(self) -> str:
         with self._lock:
@@ -31,10 +40,14 @@ class ChunkStats:
             if total == 0:
                 return ""
             drop_rate = (self.dropped / total) * 100
+            avg_ratio = self._total_speech_ratio / self._analyzed if self._analyzed else 0.0
+            avg_prob = self._total_avg_prob / self._analyzed if self._analyzed else 0.0
             return (
-                f"Chunks queued: {self.queued} | "
-                f"Chunks dropped: {self.dropped} | "
-                f"Drop rate: {drop_rate:.0f}%"
+                f"Chunks Queued: {self.queued} | "
+                f"Chunks Dropped: {self.dropped} | "
+                f"Drop Rate: {drop_rate:.0f}% | "
+                f"Avg Speech Ratio: {avg_ratio:.2f} | "
+                f"Avg Speech Probability: {avg_prob:.2f}"
             )
 
 
@@ -66,17 +79,45 @@ class AudioRecorder:
         # Chunked streaming
         self.chunked_mode = settings.chunk_duration > 0
         self._overlap_seconds = settings.chunk_overlap
-        # Step = how far the window advances each chunk (duration minus overlap)
         self._chunk_step = (
             max(settings.chunk_duration - settings.chunk_overlap, 0.001)
             if self.chunked_mode else settings.chunk_duration
         )
         self.chunk_queue = queue.Queue()
         self._chunk_counter = 0
-        self._chunk_boundary_pos = 0   # index into audio_data for step boundary
-        self._audio_sample_counts = [] # parallel to audio_data: samples per frame
+        self._chunk_boundary_pos = 0
+        self._audio_sample_counts = []
         self._chunk_producer_thread = None
         self.chunk_stats = ChunkStats()
+
+        # Optional VAD processor
+        self._silero = None
+        self._init_processors()
+        self._print_startup_info()
+
+    def _init_processors(self):
+        if self.settings.use_silero_vad:
+            from src.audio.silero_vad import SileroVAD
+            self._silero = SileroVAD(
+                sample_rate=self.settings.sample_rate,
+                threshold=self.settings.silero_threshold,
+                enabled=True,
+            )
+
+    def _print_startup_info(self):
+        sv_ok = self._silero is not None and self._silero.available
+        sv_label = "Enabled" if sv_ok else (
+            "Disabled (not installed — RMS fallback)" if self.settings.use_silero_vad
+            else "Disabled (RMS fallback)"
+        )
+
+        print(
+            f"{colorama.Fore.CYAN}"
+            f"[Pipeline] Silero VAD: {sv_label}\n"
+            f"[Pipeline] Silero Threshold: {self.settings.silero_threshold:.2f}\n"
+            f"[Pipeline] Min Speech Ratio: {self.settings.min_speech_ratio:.2f}"
+            f"{colorama.Style.RESET_ALL}"
+        )
 
     @classmethod
     def from_env(cls):
@@ -91,16 +132,32 @@ class AudioRecorder:
     def _calculate_rms(self, audio_chunk):
         return np.sqrt(np.mean(audio_chunk ** 2))
 
-    def chunk_contains_voice(self, chunk_data: list) -> bool:
-        """Return True if the chunk has enough voiced frames to be considered speech."""
+    def _analyze_chunk(self, chunk_data: list) -> tuple:
+        """
+        Returns (accepted, speech_ratio, avg_speech_probability).
+        Uses Silero VAD when available, otherwise falls back to RMS.
+        """
         if not chunk_data:
-            return False
-        n_frames = len(chunk_data)
-        voiced = sum(
-            1 for frame in chunk_data
-            if self._calculate_rms(frame) >= self.settings.noise_gate_rms
-        )
-        return (voiced / n_frames) >= self.settings.min_speech_ratio
+            return False, 0.0, 0.0
+
+        silero_ok = self._silero is not None and self._silero.available
+        if silero_ok:
+            speech_ratio, avg_prob = self._silero.chunk_speech_ratio(chunk_data)
+        else:
+            n = len(chunk_data)
+            voiced = sum(
+                1 for f in chunk_data
+                if self._calculate_rms(f) >= self.settings.noise_gate_rms
+            )
+            speech_ratio = voiced / n
+            avg_prob = speech_ratio  # proxy when Silero is unavailable
+
+        return speech_ratio >= self.settings.min_speech_ratio, speech_ratio, avg_prob
+
+    def chunk_contains_voice(self, chunk_data: list) -> bool:
+        """Legacy wrapper — prefer _analyze_chunk() for new code."""
+        accepted, _, _ = self._analyze_chunk(chunk_data)
+        return accepted
 
     def callback(self, indata, frames, time_info, status):
         if status:
@@ -156,7 +213,6 @@ class AudioRecorder:
         chunk_step = self._chunk_step
 
         while not self._stop_vad:
-            # Wait until actually recording (relevant for VAD mode)
             if not self.is_recording:
                 time.sleep(0.05)
                 continue
@@ -178,7 +234,7 @@ class AudioRecorder:
         if current_pos <= self._chunk_boundary_pos:
             return
 
-        # Build overlap window: walk back from step boundary to collect overlap_seconds
+        # Build overlap window
         overlap_samples_needed = int(self._overlap_seconds * self.settings.sample_rate)
         samples_collected = 0
         overlap_start = self._chunk_boundary_pos
@@ -188,20 +244,19 @@ class AudioRecorder:
 
         old_boundary = self._chunk_boundary_pos
         chunk_data = list(self.audio_data[overlap_start:current_pos])
-        overlap_frame_count = old_boundary - overlap_start  # frames at start that are overlap
+        overlap_frame_count = old_boundary - overlap_start
 
         self._chunk_counter += 1
         chunk_num = self._chunk_counter
         capture_ts = time.time()
 
-        # Compute window timing for log
         chunk_total_samples = sum(f.shape[0] for f in chunk_data)
         chunk_duration_s = chunk_total_samples / self.settings.sample_rate
         window_end_s = capture_ts - self.recording_start_time
         window_start_s = window_end_s - chunk_duration_s
         actual_overlap_s = samples_collected / self.settings.sample_rate
 
-        # Advance step boundary
+        # Advance boundary
         self._chunk_boundary_pos = current_pos
 
         # Trim audio_data front — keep only the overlap window for the next chunk
@@ -210,33 +265,39 @@ class AudioRecorder:
             del self._audio_sample_counts[:overlap_start]
             self._chunk_boundary_pos -= overlap_start
 
-        if self.chunk_contains_voice(chunk_data):
+        # --- Silero VAD / RMS chunk analysis ---
+        t_vad = time.perf_counter()
+        accepted, speech_ratio, avg_prob = self._analyze_chunk(chunk_data)
+        vad_ms = (time.perf_counter() - t_vad) * 1000
+
+        perf_line = f"  Silero: {vad_ms:.0f}ms | Validation: {vad_ms:.0f}ms"
+
+        if accepted:
             self.chunk_queue.put((chunk_num, chunk_data, capture_ts, overlap_frame_count))
-            self.chunk_stats.record_queued()
+            self.chunk_stats.record_queued(speech_ratio, avg_prob)
             print(
                 f"{colorama.Fore.CYAN}"
-                f"[Chunk #{chunk_num}] queued ({len(chunk_data)} frames, speech detected)\n"
+                f"[Chunk #{chunk_num}]\n"
+                f"  Speech Ratio: {speech_ratio:.2f}\n"
+                f"  Average Speech Probability: {avg_prob:.2f}\n"
+                f"  Result: QUEUED\n"
                 f"  Duration: {chunk_duration_s:.1f}s | Overlap: {actual_overlap_s:.1f}s | "
-                f"Window: {window_start_s:.1f}s → {window_end_s:.1f}s"
+                f"Window: {window_start_s:.1f}s → {window_end_s:.1f}s\n"
+                f"{perf_line}"
                 f"{colorama.Style.RESET_ALL}"
             )
         else:
-            self.chunk_stats.record_dropped()
-            if not chunk_data:
-                reason = "empty"
-            else:
-                n = len(chunk_data)
-                voiced = sum(
-                    1 for f in chunk_data
-                    if self._calculate_rms(f) >= self.settings.noise_gate_rms
-                )
-                reason = "silence" if voiced == 0 else f"noise (ratio={voiced/n:.2f})"
+            self.chunk_stats.record_dropped(speech_ratio, avg_prob)
             print(
-                f"{colorama.Fore.YELLOW}[Chunk #{chunk_num}] dropped "
-                f"({reason}){colorama.Style.RESET_ALL}"
+                f"{colorama.Fore.YELLOW}"
+                f"[Chunk #{chunk_num}]\n"
+                f"  Speech Ratio: {speech_ratio:.2f}\n"
+                f"  Average Speech Probability: {avg_prob:.2f}\n"
+                f"  Result: DROPPED\n"
+                f"{perf_line}"
+                f"{colorama.Style.RESET_ALL}"
             )
 
-        # Print cumulative stats every 10 chunks
         if self._chunk_counter % 10 == 0:
             summary = self.chunk_stats.summary()
             if summary:

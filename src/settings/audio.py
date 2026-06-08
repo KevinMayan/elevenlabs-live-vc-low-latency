@@ -18,6 +18,8 @@ class AudioSettings:
         optimize_streaming_latency=4,
         min_speech_ratio=0.25,
         noise_gate_rms=0.01,
+        use_silero_vad=False,
+        silero_threshold=0.5,
     ):
         self.mode = mode
         self.sample_rate = sample_rate
@@ -42,6 +44,8 @@ class AudioSettings:
         self.optimize_streaming_latency = optimize_streaming_latency
         self.min_speech_ratio = min_speech_ratio
         self.noise_gate_rms = noise_gate_rms
+        self.use_silero_vad = use_silero_vad
+        self.silero_threshold = silero_threshold
 
     def valid_modes(self):
         return [0, 1]
@@ -75,4 +79,6 @@ class AudioSettings:
             optimize_streaming_latency=int(os.getenv("OPTIMIZE_STREAMING_LATENCY", 4)),
             min_speech_ratio=float(os.getenv("MIN_SPEECH_RATIO", 0.25)),
             noise_gate_rms=float(os.getenv("NOISE_GATE_RMS", 0.01)),
+            use_silero_vad=os.getenv("USE_SILERO_VAD", "0") in ("1", "true", "True", "yes"),
+            silero_threshold=float(os.getenv("SILERO_THRESHOLD", 0.5)),
         )

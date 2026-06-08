@@ -7,3 +7,5 @@ librosa==0.11.0
 colorama==0.4.6
 elevenlabs==1.12.1
 keyboard==0.13.5
+# Optional: neural VAD (USE_SILERO_VAD=1) — pulls in torch
+silero-vad

@@ -33,14 +33,18 @@ Original author: https://github.com/cavoq
 | Perceived latency | utterance length + ~2.8 s | ~2.8 s after first chunk (typically < 7 s) |
 | `optimize_streaming_latency` | Not exposed | Configurable via env var |
 | Latency metrics | First-chunk time only | Per-chunk breakdown + rolling averages |
-| Silence/noise chunks | Always uploaded | Filtered out before upload (VAD gate) |
+| Speech detection | RMS threshold | Silero VAD neural probabilities (optional) |
+| Silence/noise chunks | Always uploaded | Filtered out before upload |
 
 ### How chunked mode works
 
 ```
 Mic → [AudioRecorder]
-         │  every CHUNK_DURATION_SECONDS - CHUNK_OVERLAP_SECONDS
-         ▼
+         │
+         ▼  (optional, USE_SILERO_VAD=1)
+    [Silero VAD]  — per-frame speech probability
+         │
+         ▼  chunk validation (speech_ratio >= MIN_SPEECH_RATIO)
       chunk_queue  ←─────────────────────────────────────┐
          │                                               │
          ▼                                        (still recording)
@@ -80,8 +84,8 @@ causing missing syllables and unnatural starts/ends.
   - **Automatic (MODE=1)** - Voice Activity Detection auto-detects speech
   - **Chunked streaming** - Overlay on MODE=0 or MODE=1 via `CHUNK_DURATION_SECONDS`
 - **Overlapping sliding window** - Configurable overlap between chunks so the STS model always has prior-speech context, reducing clipped words at boundaries
-- **Chunk filtering** - Silent and noisy chunks are dropped before upload, saving API credits and reducing clutter
-- **Per-chunk latency dashboard** - Console output with rolling averages and drop-rate stats
+- **Silero VAD** *(optional)* - Replaces RMS-based chunk filtering with neural speech probabilities; significantly reduces false-positive uploads from background noise
+- **Per-chunk latency dashboard** - Console output with rolling averages, speech ratios, VAD probabilities, and drop-rate stats
 - **Configurable Audio Settings** - Sample rate, channels, silence threshold, noise reduction
 
 ## Use Cases
@@ -125,6 +129,18 @@ uv sync
 pip install -r requirements.txt
 ```
 
+#### Optional: Silero VAD
+
+Silero VAD is opt-in. Install it only when you want neural speech detection:
+
+```bash
+# Silero VAD — neural speech detection (USE_SILERO_VAD=1)
+# also installs PyTorch (CPU-only recommended to save space):
+pip install silero-vad
+```
+
+If not installed, the pipeline falls back to RMS-based filtering automatically.
+
 ### 3. Environment Variables
 
 Create a file named `.env` in the root directory:
@@ -160,9 +176,13 @@ MODE=0
 # CHUNK_OVERLAP_SECONDS=1       # overlap between chunks (must be < CHUNK_DURATION_SECONDS)
 # OPTIMIZE_STREAMING_LATENCY=4  # ElevenLabs latency hint 0-4 (4 = most aggressive)
 
-# Optional - Chunk filtering (VAD gate before upload)
-# MIN_SPEECH_RATIO=0.25         # fraction of frames that must exceed noise gate to keep a chunk
-# NOISE_GATE_RMS=0.01           # per-frame RMS threshold used by the speech ratio filter
+# Optional - Neural VAD (requires: pip install silero-vad)
+# USE_SILERO_VAD=1              # 1=Replace RMS filter with Silero VAD
+# SILERO_THRESHOLD=0.5          # speech probability threshold (0.0–1.0)
+
+# Optional - Chunk filtering
+# MIN_SPEECH_RATIO=0.25         # fraction of frames that must be speech to keep a chunk
+# NOISE_GATE_RMS=0.01           # per-frame RMS threshold (used when Silero VAD is disabled)
 # MIN_AUDIO_DURATION=0.1        # minimum audio duration in seconds before processing
 ```
 
@@ -214,26 +234,50 @@ Startup summary printed on launch:
   Effective Step: 3.0s
 ```
 
-Console output per chunk:
+### Silero VAD (Neural Speech Detection)
 
-```
-[Chunk #1] queued (187 frames, speech detected)
-  Duration: 3.0s | Overlap: 0.0s | Window: 0.0s → 3.0s
-[Chunk #1] uploading...
-[Chunk #1] Capture→First-audio: 6821ms | Upload delay: 42ms | EL latency: 2784ms
-  Rolling avg (n=1) | First-chunk: 2784ms | Queue delay: 42ms
+For noisy environments or Bluetooth microphones that introduce compression artefacts,
+replace the default RMS filter with Silero VAD:
 
-[Chunk #2] queued (234 frames, speech detected)
-  Duration: 4.0s | Overlap: 1.0s | Window: 3.0s → 7.0s
-
-[Chunk #3] dropped (silence)
-[Chunk #4] dropped (noise (ratio=0.12))
-...
-[Stats] Chunks queued: 8 | Chunks dropped: 2 | Drop rate: 20%   ← every 10 chunks
+```env
+USE_SILERO_VAD=1
+SILERO_THRESHOLD=0.5
+MIN_SPEECH_RATIO=0.25
 ```
 
-The first chunk has no overlap (there is no prior audio to look back to). From chunk 2
-onward each chunk includes the last `CHUNK_OVERLAP_SECONDS` of the previous chunk.
+Silero VAD outputs a speech probability (0–1) for every 32 ms window of audio.
+A chunk is queued for upload only if the fraction of windows above `SILERO_THRESHOLD`
+meets `MIN_SPEECH_RATIO`. Otherwise it is dropped silently.
+
+The model runs on CPU and is loaded once at startup. Silero VAD downsamples
+internally from whatever sample rate you configure.
+
+**Startup log with Silero VAD enabled:**
+
+```
+[Pipeline] Silero VAD: Enabled
+[Pipeline] Silero Threshold: 0.50
+[Pipeline] Min Speech Ratio: 0.25
+```
+
+**Per-chunk console output:**
+
+```
+[Chunk #42]
+  Speech Ratio: 0.78
+  Average Speech Probability: 0.84
+  Result: QUEUED
+  Duration: 3.0s | Overlap: 1.0s | Window: 6.0s → 9.0s
+  Silero: 4ms | Validation: 4ms
+
+[Chunk #43]
+  Speech Ratio: 0.11
+  Average Speech Probability: 0.19
+  Result: DROPPED
+  Silero: 3ms | Validation: 3ms
+
+[Stats] Chunks Queued: 8 | Chunks Dropped: 2 | Drop Rate: 20% | Avg Speech Ratio: 0.71 | Avg Speech Probability: 0.76
+```
 
 ### Commands
 
@@ -300,9 +344,37 @@ docker run --env-file .env -it --privileged -v /dev/input:/dev/input el-live-vc
 
 ### Too many chunks dropped
 
+With RMS filtering (Silero disabled):
 - Lower `MIN_SPEECH_RATIO` (e.g. `0.10`) if legitimate speech is being filtered out
 - Lower `NOISE_GATE_RMS` (e.g. `0.005`) if your microphone is quiet
-- Raise `NOISE_GATE_RMS` (e.g. `0.02`) to be more aggressive about dropping background noise
+- Raise `NOISE_GATE_RMS` (e.g. `0.02`) to drop more background noise
+
+With Silero VAD enabled:
+- Lower `SILERO_THRESHOLD` (e.g. `0.35`) to accept quieter or more distant speech
+- Lower `MIN_SPEECH_RATIO` (e.g. `0.15`) to accept chunks with less speech content
+- Check the "Avg Speech Probability" in the periodic stats — if it is consistently below
+  your threshold, your threshold is too aggressive for your mic/environment
+
+### ElevenLabs generating hallucinated words
+
+This is usually caused by noise being uploaded as audio. Enable Silero VAD:
+
+```env
+USE_SILERO_VAD=1
+SILERO_THRESHOLD=0.5
+MIN_SPEECH_RATIO=0.25
+```
+
+Then raise `SILERO_THRESHOLD` incrementally (e.g. `0.6`, `0.7`) until the false uploads
+stop. Monitor the "Speech Ratio" and "Avg Speech Probability" lines in the console to
+find the right balance.
+
+### Silero VAD not loading
+
+- Ensure the package is installed: `pip install silero-vad`
+- On first run the model is downloaded and cached; this requires an internet connection
+- If installation fails, set `USE_SILERO_VAD=0` — the pipeline falls back to
+  RMS-based filtering automatically
 
 ### Chunked mode: clipped words or unnatural transitions
 
@@ -324,8 +396,8 @@ docker run --env-file .env -it --privileged -v /dev/input:/dev/input el-live-vc
 | `SAMPLE_RATE` | 48000 | Mic capture sample rate (Hz) |
 | `CHANNELS` | 1 | Audio channels (1 = mono) |
 | `SILENCE_THRESHOLD` | 0.01 | Silence trim threshold (RMS) |
-| `VAD_THRESHOLD` | 0.01 | Voice detection threshold (RMS) |
-| `REMOVE_BACKGROUND_NOISE` | 1 | 1=Enable, 0=Disable |
+| `VAD_THRESHOLD` | 0.01 | Voice onset detection threshold (RMS) |
+| `REMOVE_BACKGROUND_NOISE` | 1 | 1=Enable ElevenLabs background noise removal |
 | `OUTPUT_SAMPLE_RATE` | 48000 | Playback device sample rate (Hz) |
 | `API_SAMPLE_RATE` | 22050 | ElevenLabs PCM output rate (Hz) |
 | `OUTPUT_DEVICE` | — | Output device index |
@@ -337,10 +409,12 @@ docker run --env-file .env -it --privileged -v /dev/input:/dev/input el-live-vc
 | `VAD_PRE_BUFFER_DURATION` | 0.5 | Pre-buffer duration (s) |
 | `MODE` | 0 | 0=Manual, 1=VAD |
 | `CHUNK_DURATION_SECONDS` | 0 | Chunk size in seconds; 0 = disabled |
-| `CHUNK_OVERLAP_SECONDS` | 0 | Overlap between chunks in seconds (must be < `CHUNK_DURATION_SECONDS`); effective step = duration − overlap |
+| `CHUNK_OVERLAP_SECONDS` | 0 | Overlap between chunks (must be < `CHUNK_DURATION_SECONDS`) |
 | `OPTIMIZE_STREAMING_LATENCY` | 4 | ElevenLabs latency hint (0–4) |
-| `MIN_SPEECH_RATIO` | 0.25 | Fraction of frames above `NOISE_GATE_RMS` required to keep a chunk |
-| `NOISE_GATE_RMS` | 0.01 | Per-frame RMS threshold for the speech ratio filter |
+| `USE_SILERO_VAD` | 0 | 1=Replace RMS filter with Silero VAD neural detection (requires `pip install silero-vad`) |
+| `SILERO_THRESHOLD` | 0.5 | Speech probability threshold for Silero VAD (0.0–1.0); frames above this count as speech |
+| `MIN_SPEECH_RATIO` | 0.25 | Fraction of frames/windows that must be speech to keep a chunk |
+| `NOISE_GATE_RMS` | 0.01 | Per-frame RMS threshold used when `USE_SILERO_VAD=0` |
 | `MIN_AUDIO_DURATION` | 0.1 | Minimum audio duration (s) before a recording is processed |
 
 ## License
@@ -351,6 +425,6 @@ GNU General Public License v3.0 - See [LICENSE](LICENSE) for details.
 
 - **Original author**: [cavoq](https://github.com/cavoq)
 - **Additional contributors**: [ayeantics](https://github.com/ayeantics)
-- **Fork modifications**: chunked streaming pipeline, overlapping sliding-window chunks, persistent playback stream, VAD-based chunk filtering, latency metrics
+- **Fork modifications**: chunked streaming pipeline, overlapping sliding-window chunks, persistent playback stream, Silero VAD chunk filtering, latency metrics
 - **ElevenLabs**: [https://elevenlabs.io](https://elevenlabs.io)
 - **VB-Audio**: [https://vb-audio.com](https://vb-audio.com)
